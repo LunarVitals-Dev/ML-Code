@@ -69,7 +69,7 @@ def process_subject_data(folder_path, subject_id, extract_base_folder):
 
     extract_zip(zip_file_path, extract_folder)
 
-    # Load sensor data
+    # Load sensor data - using only HR (BPM) and TEMP
     hr_values, hr_rate = load_csv_data(extract_folder, 'HR.csv')
     temp_values, temp_rate = load_csv_data(extract_folder, 'TEMP.csv')
     if hr_values is None or temp_values is None:
@@ -99,7 +99,7 @@ def process_subject_data(folder_path, subject_id, extract_base_folder):
     hr_scaled = scaler.fit_transform(hr_values.reshape(-1, 1))
     temp_scaled = scaler.fit_transform(temp_values.reshape(-1, 1))
 
-    X = np.hstack((hr_scaled, temp_scaled))
+    X = np.hstack((hr_scaled, temp_scaled))  # Only using HR (BPM) and temperature
     Y = activity_encoded  # Classification target
 
     return X, Y, encoder, scaler
@@ -110,12 +110,22 @@ def train_activity_model():
     extract_base_folder = 'extracted_files'
     all_subjects_X, all_subjects_Y = [], []
     encoder = None
-    scaler = None
+    hr_scaler = StandardScaler()
+    temp_scaler = StandardScaler()
 
     for subject_id in range(1, 16):
         subject_data = process_subject_data(folder_path, subject_id, extract_base_folder)
         if subject_data is not None:
-            X, Y, encoder, scaler = subject_data
+            X, Y, encoder, _ = subject_data
+            
+            # Split X into HR and TEMP components (assuming it's a 2-column matrix)
+            hr_data = X[:, 0].reshape(-1, 1)  # First column is HR
+            temp_data = X[:, 1].reshape(-1, 1)  # Second column is TEMP
+            
+            # Fit scalers on the data
+            hr_scaler.partial_fit(hr_data)
+            temp_scaler.partial_fit(temp_data)
+            
             all_subjects_X.append(X)
             all_subjects_Y.append(Y)
         else:
@@ -124,6 +134,9 @@ def train_activity_model():
     if not all_subjects_X:
         print("No data processed.")
         return None, None, None
+
+    # Create a scaler dictionary
+    scaler = {'bpm': hr_scaler, 'temp': temp_scaler}
 
     # Combine data from all subjects
     X_combined = np.concatenate(all_subjects_X, axis=0)
@@ -135,8 +148,9 @@ def train_activity_model():
     num_classes = Y_train.shape[1]  # Number of unique activity classes
 
     # --- Neural Network Model ---
+    # Note: Input shape is now 2 (BPM and body temperature) instead of more features
     model = tf.keras.Sequential([
-        layers.InputLayer(input_shape=(X_train.shape[1],)),
+        layers.InputLayer(shape=(2,)),  # Input shape is (2) for [BPM, body_temp]
         layers.Dense(64, activation='relu'),
         layers.Dense(32, activation='relu'),
         layers.Dense(num_classes, activation='softmax')  # Classification output
@@ -147,7 +161,7 @@ def train_activity_model():
                 metrics=['accuracy'])
 
     # Train the model
-    history = model.fit(X_train, Y_train, epochs=10, batch_size=32, validation_split=0.2, verbose=1)
+    history = model.fit(X_train, Y_train, epochs=20, batch_size=32, validation_split=0.2, verbose=1)
 
     # Evaluate model
     evaluation = model.evaluate(X_test, Y_test, verbose=1)
@@ -171,10 +185,10 @@ def train_activity_model():
     print("\nClassification Report:")
     print(classification_report(actual_labels, predicted_labels, target_names=activity_names))
 
-    # Save model and preprocessing objects
-    model.save('activity_model')
-    joblib.dump(encoder, 'activity_encoder.joblib')
-    joblib.dump(scaler, 'feature_scaler.joblib')
+    # Save model and preprocessing objects with correct format for Keras 3
+    model.save('activity_model_bpm_temp.keras')  
+    joblib.dump(encoder, 'activity_encoder_bpm_temp.joblib')
+    joblib.dump({'bpm': hr_scaler, 'temp': temp_scaler}, 'feature_scaler_bpm_temp.joblib')
 
     print("Model, encoder, and scaler saved successfully.")
     return model, encoder, scaler
@@ -210,7 +224,7 @@ def fetch_sensor_data():
     return data
 
 def process_sensor_data(data):
-    """Process and combine sensor data into a DataFrame."""
+    """Process and combine sensor data into a DataFrame with averaged BPM."""
     if not data:
         return None
         
@@ -228,23 +242,42 @@ def process_sensor_data(data):
             'activity_id': docs_at_timestamp[0].get('activity_id', 'unknown')
         }
         
+        pulse_bpm = None
+        respiratory_rate = None
+        body_temp = None
+        
         for doc in docs_at_timestamp:
             if 'PulseSensor' in doc:
-                record['pulse_BPM'] = doc['PulseSensor'].get('pulse_BPM', 0)
+                pulse_bpm = doc['PulseSensor'].get('pulse_BPM', None)
             if 'RespiratoryRate' in doc:
-                record['BRPM'] = doc['RespiratoryRate'].get('BRPM', 0)
-            if 'MPU_Gyroscope' in doc:
-                record['steps'] = doc['MPU_Gyroscope'].get('steps', 0)
+                respiratory_rate = doc['RespiratoryRate'].get('BRPM', None)
             if 'MLX_ObjectTemperature' in doc:
-                record['body_temp'] = doc['MLX_ObjectTemperature'].get('Celsius', 0)
+                body_temp = doc['MLX_ObjectTemperature'].get('Celsius', None)
         
-        # Only keep records with all required fields
-        if all(k in record for k in ['pulse_BPM', 'BRPM', 'steps', 'body_temp']):
+        # Calculate average BPM if both values are available
+        if pulse_bpm is not None and respiratory_rate is not None:
+            record['avg_bpm'] = (pulse_bpm + respiratory_rate) / 2
+        elif pulse_bpm is not None:
+            record['avg_bpm'] = pulse_bpm
+        elif respiratory_rate is not None:
+            record['avg_bpm'] = respiratory_rate
+        else:
+            # Skip this record if no BPM data available
+            continue
+            
+        if body_temp is not None:
+            record['body_temp'] = body_temp
+        else:
+            # Skip this record if no temperature data available
+            continue
+        
+        # Only keep records with both required fields
+        if all(k in record for k in ['avg_bpm', 'body_temp']):
             processed_data.append(record)
     
     df = pd.DataFrame(processed_data)
     if len(df) > 0:
-        print(f"Processed {len(df)} complete records")
+        print(f"Processed {len(df)} complete records with averaged BPM and body temperature")
         # Show data distribution
         print("\nData summary:")
         print(df.describe())
@@ -261,38 +294,42 @@ def load_or_train_model():
     """Load the pretrained model or train a new one if not available."""
     try:
         # Try to load the saved model and preprocessing objects
-        model = tf.keras.models.load_model('activity_model')
-        encoder = joblib.load('activity_encoder.joblib')
-        scaler = joblib.load('feature_scaler.joblib')
-        print("Loaded pre-trained model and preprocessing objects")
+        model = tf.keras.models.load_model('activity_model_bpm_temp.keras')
+        encoder = joblib.load('activity_encoder_bpm_temp.joblib')
+        
+        # Create new scalers since we'll be using our own scaling approach
+        bpm_scaler = StandardScaler()
+        temp_scaler = StandardScaler()
+        scaler = {'bpm': bpm_scaler, 'temp': temp_scaler}
+        
+        print("Loaded pre-trained model and created new scalers")
         return model, encoder, scaler
-    except (OSError, IOError):
-        print("Pre-trained model not found. Training a new model...")
+    except (OSError, IOError, ValueError) as e:
+        print(f"Error loading pre-trained model: {e}")
+        print("Training a new model...")
         return train_activity_model()
 
 def process_mongodb_data_for_model(df, scaler):
     """Process the MongoDB data for model prediction."""
-    # For MongoDB data, we may have different features
-    # We need to map them to what our model expects
-    
-    # If model was trained on HR and TEMP, but MongoDB has pulse_BPM, BRPM, steps, body_temp
-    # We need to handle this mapping
-    
     # Check if we have all required features
-    required_features = ['pulse_BPM', 'BRPM', 'steps', 'body_temp']
+    required_features = ['avg_bpm', 'body_temp']
     if not all(feature in df.columns for feature in required_features):
         missing = [feat for feat in required_features if feat not in df.columns]
         print(f"Missing required features in MongoDB data: {missing}")
         return None
     
     # Extract features
-    X = df[required_features].values
+    X_bpm = df['avg_bpm'].values.reshape(-1, 1)
+    X_temp = df['body_temp'].values.reshape(-1, 1)
     
-    # Normalize features using the same scaler used during training
-    # This assumes the scaler was fit on similar data
-    # If the features are different, we may need to adapt this
-    X_scaled = scaler.transform(X)
+    # Apply scaling to each feature separately
+    X_bpm_scaled = scaler['bpm'].transform(X_bpm)
+    X_temp_scaled = scaler['temp'].transform(X_temp)
     
+    # Combine the scaled features
+    X_scaled = np.hstack((X_bpm_scaled, X_temp_scaled))
+    
+    print(f"Feature shape after scaling: {X_scaled.shape}")
     return X_scaled
 
 def predict_activities_from_mongodb(df, model, encoder):
@@ -301,17 +338,25 @@ def predict_activities_from_mongodb(df, model, encoder):
         print("No data available for prediction")
         return None
     
-    # Get feature scaler (assuming it was saved with the model)
-    try:
-        scaler = joblib.load('feature_scaler.joblib')
-    except (OSError, IOError):
-        print("Feature scaler not found. Cannot scale the MongoDB data correctly.")
-        return None
+    # Create a new scaler for each feature
+    bpm_scaler = StandardScaler()
+    temp_scaler = StandardScaler()
+    
+    # Fit scalers on the MongoDB data
+    bpm_scaler.fit(df['avg_bpm'].values.reshape(-1, 1))
+    temp_scaler.fit(df['body_temp'].values.reshape(-1, 1))
+    
+    # Create a combined scaler dictionary
+    scaler = {'bpm': bpm_scaler, 'temp': temp_scaler}
     
     # Process data for model
     X_scaled = process_mongodb_data_for_model(df, scaler)
     if X_scaled is None:
         return None
+    
+    # Print some diagnostic information
+    print(f"Model input shape: {model.input_shape}")
+    print(f"Data shape for prediction: {X_scaled.shape}")
     
     # Make predictions
     predictions = model.predict(X_scaled)
@@ -333,7 +378,9 @@ def compare_predictions_with_actual(df, predicted_activities):
         'Timestamp': df['timestamp'],
         'Actual Activity': df['activity_id'],
         'Predicted Activity': predicted_activities,
-        'Match': df['activity_id'] == predicted_activities
+        'Match': df['activity_id'] == predicted_activities,
+        'BPM': df['avg_bpm'],
+        'Body Temp': df['body_temp']
     })
     
     # Calculate accuracy
@@ -362,7 +409,7 @@ def compare_predictions_with_actual(df, predicted_activities):
 
 def main():
     """Main function to run the entire workflow."""
-    print("Starting the activity prediction workflow...")
+    print("Starting the activity prediction workflow with averaged BPM and body temperature...")
     
     # Step 1: Load or train the model
     print("\n--- Step 1: Loading/Training the Model ---")
@@ -378,8 +425,8 @@ def main():
         print("Failed to fetch data from MongoDB. Exiting.")
         return
     
-    # Step 3: Process the MongoDB data
-    print("\n--- Step 3: Processing MongoDB Data ---")
+    # Step 3: Process the MongoDB data - averaging pulse_BPM and BRPM
+    print("\n--- Step 3: Processing MongoDB Data with Averaged BPM ---")
     mongo_df = process_sensor_data(mongo_data)
     if mongo_df is None or len(mongo_df) == 0:
         print("No valid data processed from MongoDB. Exiting.")
@@ -400,8 +447,8 @@ def main():
         print(comparison.head(10))
         
         # Save the comparison to a CSV file
-        comparison.to_csv('activity_prediction_comparison.csv', index=False)
-        print("\nComparison results saved to 'activity_prediction_comparison.csv'")
+        comparison.to_csv('activity_prediction_comparison_bpm_temp.csv', index=False)
+        print("\nComparison results saved to 'activity_prediction_comparison_bpm_temp.csv'")
     
     print("\nWorkflow completed successfully!")
 
