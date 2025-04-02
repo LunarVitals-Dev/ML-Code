@@ -4,3 +4,6 @@ tensorflow
 scikit-learn
 pymongo
 python-dateutil
+dotenv
+zipfile
+joblib
